@@ -6,3 +6,5 @@ dqn/report.md
 dqn/wandb/
 dqn/__pycache__/
 dqn/report.pdf
+.vscode/settings.json
+td3/wandb/
