@@ -107,7 +107,7 @@ class Critic(nn.Module):
 
 class TD3:
     def __init__(self, state_dim, action_dim, max_action, 
-                 gamma, tau, 
+                 tau, gamma, 
                  policy_noise, noise_clip, policy_delay):
         
         self.max_action = max_action
@@ -183,7 +183,9 @@ class TD3:
 
     def _update_actor(self, batch):
         state, action, reward, next_state, done = batch
-        actor_loss = -self.Q1(state, self.actor(state)).mean()
+        current_action = self.actor(state)
+        actor_loss = -self.Q1(state, current_action).mean()
+
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
