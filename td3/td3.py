@@ -20,8 +20,8 @@ import wandb
 # CLI
 # 
 parser = argparse.ArgumentParser()
-parser.add_argument("--env", type=str, default="HalfCheetah-v5",
-                    help="MuJoCo environment name (e.g. HalfCheetah-v5, Ant-v5)")
+parser.add_argument("--env", type=str, default="HalfCheetah-v4",
+                    help="MuJoCo environment name (e.g. HalfCheetah-v4, Ant-v4)")
 args = parser.parse_args()
 
 # 
