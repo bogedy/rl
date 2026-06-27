@@ -1,0 +1,69 @@
+# ── TD3 Bayesian Hyperparameter Sweep (Ant-v4 only) ──
+# We use a single environment because mixing envs with different reward
+# scales (e.g. HalfCheetah ~10k vs Ant ~5k) biases the Bayesian optimizer
+# toward the higher-return env rather than the hyperparameters themselves.
+# Ant-v4 is the harder, more interesting environment.
+#
+# NOTE: log_uniform_values takes the ACTUAL min/max bounds. (Plain
+# log_uniform interprets them as natural-log exponents, which silently
+# pins tau and lr near ~1.0 — degenerate.)
+#
+# Usage:
+#   1. wandb sweep sweep.yaml              → prints <sweep_id>
+#   2. ./run_sweep.sh <sweep_id>           → launches 8 parallel agents
+
+program: td3.py
+name: td3-ant-bayes-sweep
+method: bayes
+
+metric:
+  name: eval_return
+  goal: maximize
+
+parameters:
+  env:
+    value: "Ant-v4"
+  gamma:
+    values: [0.98, 0.99, 0.995]
+  tau:
+    distribution: log_uniform_values
+    min: 0.001
+    max: 0.01
+  lr_actor:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.0004
+  lr_critic:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.0004
+  hidden1:
+    values: [256, 512]
+  hidden2:
+    values: [256, 512]
+  batch_size:
+    values: [128, 256]
+  start_timesteps:
+    values: [10000, 25000]
+  expl_noise:
+    distribution: uniform
+    min: 0.1
+    max: 0.2
+  policy_noise:
+    value: 0.2
+  noise_clip:
+    value: 0.5
+  policy_delay:
+    value: 2
+
+# Kill clearly-bad runs early to save compute.
+# With eval_every=5000 and max_steps=200000 we get ~40 eval points.
+early_terminate:
+  type: hyperband
+  min_iter: 3
+
+command:
+  - python
+  - ${program}
+  - --max_steps
+  - 200000

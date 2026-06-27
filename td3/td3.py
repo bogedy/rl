@@ -19,46 +19,119 @@ import wandb
 # 
 # CLI
 # 
-parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument("--env", type=str, default="HalfCheetah-v4",
                     help="MuJoCo environment name (e.g. HalfCheetah-v4, Ant-v4)")
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--max_steps", type=int, default=1_000_000)
+parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
+parser.add_argument("--results_file", type=str, default=None,
+                    help="If set, write final results JSON to this path")
+parser.add_argument("--device", type=str, default="auto",
+                    help="Device: 'auto', 'cuda', 'cpu'")
+
+# hyperparameters
+parser.add_argument("--gamma", type=float, default=0.99)
+parser.add_argument("--tau", type=float, default=0.005)
+parser.add_argument("--lr_actor", type=float, default=3e-4)
+parser.add_argument("--lr_critic", type=float, default=3e-4)
+parser.add_argument("--hidden1", type=int, default=256)
+parser.add_argument("--hidden2", type=int, default=256)
+parser.add_argument("--batch_size", type=int, default=256)
+parser.add_argument("--start_timesteps", type=int, default=25_000)
+parser.add_argument("--expl_noise", type=float, default=0.1)
+parser.add_argument("--policy_noise", type=float, default=0.2)
+parser.add_argument("--noise_clip", type=float, default=0.5)
+parser.add_argument("--policy_delay", type=int, default=2)
+parser.add_argument("--eval_every", type=int, default=5_000)
+parser.add_argument("--log_every", type=int, default=1_000)
+
 args = parser.parse_args()
 
+# ── WandB init ──
+# Must happen BEFORE global hyperparam assignments so that when running as a
+# sweep agent, the sampled values in wandb.config can override the CLI defaults.
+_wandb_run = None
+if not args.no_wandb:
+    try:
+        _wandb_run = wandb.init(
+            project="td3-mujoco",
+            config={
+                "env": args.env,
+                "gamma": args.gamma,
+                "tau": args.tau,
+                "lr_actor": args.lr_actor,
+                "lr_critic": args.lr_critic,
+                "hidden1": args.hidden1,
+                "hidden2": args.hidden2,
+                "batch_size": args.batch_size,
+                "start_timesteps": args.start_timesteps,
+                "expl_noise": args.expl_noise,
+                "policy_noise": args.policy_noise,
+                "noise_clip": args.noise_clip,
+                "policy_delay": args.policy_delay,
+                "max_steps": args.max_steps,
+                "eval_every": args.eval_every,
+                "seed": args.seed,
+                "device": args.device,
+            },
+        )
+        # Sweep overrides: wandb.config has the sampled values.
+        # Push them back into args so downstream globals reflect the sweep.
+        for k, v in wandb.config.items():
+            if hasattr(args, k):
+                setattr(args, k, v)
+        wandb.define_metric("eval_step")
+        wandb.define_metric("eval_return", step_metric="eval_step")
+    except Exception as e:
+        raise RuntimeError(
+            f"W&B initialisation failed: {e}\n"
+            "Run `wandb login` and ensure the `wandb` package is installed."
+        ) from e
+
 # 
-# hyperparams (TD3 defaults)
+# hyperparams (from CLI, possibly overridden by sweep)
 # 
 ENV_NAME = args.env
-SEED = 42
 
-GAMMA = 0.99
-TAU = 0.005 # polyak coefficient for smooth target updates
-LR_ACTOR = 3e-4
-LR_CRITIC = 3e-4
-HIDDEN = (256, 256) # paper uses (400, 300) with the actions added back into the Q network after the first layer...
+# When running inside a wandb sweep, derive a unique seed from the run id so
+# each trial gets a different seed without it being a tunable parameter.
+if _wandb_run is not None and getattr(_wandb_run, "sweep_id", None) is not None:
+    SEED = abs(hash(_wandb_run.id)) % (2**31)
+else:
+    SEED = args.seed
+
+GAMMA = args.gamma
+TAU = args.tau
+LR_ACTOR = args.lr_actor
+LR_CRITIC = args.lr_critic
+HIDDEN = (args.hidden1, args.hidden2)
 
 REPLAY_CAPACITY = 1_000_000
-BATCH_SIZE = 256
-START_TIMESTEPS = 25_000 # random warmup to fill the buffer
+BATCH_SIZE = args.batch_size
+START_TIMESTEPS = args.start_timesteps
 
-EXPL_NOISE = 0.1 # std of gaussian exploration noise
-POLICY_NOISE = 0.2 #std of target-smoothing noise (in the target)
-NOISE_CLIP = 0.5 #clip range for the smoothing noise
-POLICY_DELAY = 2  #d, update actor + targets every d critic steps
+EXPL_NOISE = args.expl_noise
+POLICY_NOISE = args.policy_noise
+NOISE_CLIP = args.noise_clip
+POLICY_DELAY = args.policy_delay
 
-MAX_STEPS = 1_000_000
-EVAL_EVERY = 5_000
+MAX_STEPS = args.max_steps
+EVAL_EVERY = args.eval_every
 EVAL_EPISODES = 10
 EVAL_MAX_STEPS = 1_000
-NUM_EVAL_WORKERS = 5
-LOG_EVERY = 1_000
+NUM_EVAL_WORKERS = 10
+LOG_EVERY = args.log_every
 EPOCH_SIZE = 50_000
-Q_TRACK_STATES = 1_000 #fixed states for overestimation tracking
+Q_TRACK_STATES = 1_000  # fixed states for overestimation tracking
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
 
 def get_device() -> torch.device:
+    if args.device != "auto":
+        return torch.device(args.device)
     if torch.cuda.is_available():
         return torch.device("cuda")
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -69,18 +142,18 @@ def get_device() -> torch.device:
 DEVICE = get_device()
 
 class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, max_action):
+    def __init__(self, state_dim, action_dim, max_action, hidden=HIDDEN):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.max_action = max_action
 
         self.net = nn.Sequential(
-            nn.Linear(state_dim, HIDDEN[0]),
+            nn.Linear(state_dim, hidden[0]),
             nn.ReLU(),
-            nn.Linear(HIDDEN[0], HIDDEN[1]),
+            nn.Linear(hidden[0], hidden[1]),
             nn.ReLU(),
-            nn.Linear(HIDDEN[1], action_dim),
+            nn.Linear(hidden[1], action_dim),
             nn.Tanh()
         )
 
@@ -90,14 +163,14 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, hidden=HIDDEN):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, HIDDEN[0]),
+            nn.Linear(state_dim + action_dim, hidden[0]),
             nn.ReLU(),
-            nn.Linear(HIDDEN[0], HIDDEN[1]),
+            nn.Linear(hidden[0], hidden[1]),
             nn.ReLU(),
-            nn.Linear(HIDDEN[1], 1)
+            nn.Linear(hidden[1], 1)
         )
 
     def forward(self, state, action):
@@ -108,7 +181,8 @@ class Critic(nn.Module):
 class TD3:
     def __init__(self, state_dim, action_dim, max_action, 
                  tau, gamma, 
-                 policy_noise, noise_clip, policy_delay):
+                 policy_noise, noise_clip, policy_delay,
+                 lr_actor=LR_ACTOR, lr_critic=LR_CRITIC, hidden=HIDDEN):
         
         self.max_action = max_action
         self.gamma = gamma
@@ -117,16 +191,16 @@ class TD3:
         self.noise_clip = noise_clip
         self.policy_delay = policy_delay
 
-        self.Q1 = Critic(state_dim, action_dim).to(DEVICE)
-        self.Q2 = Critic(state_dim, action_dim).to(DEVICE)
+        self.Q1 = Critic(state_dim, action_dim, hidden).to(DEVICE)
+        self.Q2 = Critic(state_dim, action_dim, hidden).to(DEVICE)
         self.Q1_target = copy.deepcopy(self.Q1)
         self.Q2_target = copy.deepcopy(self.Q2)
-        self.Q1_optimizer = torch.optim.Adam(self.Q1.parameters(), lr=LR_CRITIC)
-        self.Q2_optimizer = torch.optim.Adam(self.Q2.parameters(), lr=LR_CRITIC)
+        self.Q1_optimizer = torch.optim.Adam(self.Q1.parameters(), lr=lr_critic)
+        self.Q2_optimizer = torch.optim.Adam(self.Q2.parameters(), lr=lr_critic)
 
-        self.actor = Actor(state_dim, action_dim, max_action).to(DEVICE)
+        self.actor = Actor(state_dim, action_dim, max_action, hidden).to(DEVICE)
         self.actor_target = copy.deepcopy(self.actor)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
 
         self.total_it = 0
 
@@ -293,39 +367,8 @@ class ReplayBuffer:
 # wandb setup
 # 
 def init_wandb():
-    try:
-        run = wandb.init(
-            project="td3-mujoco",
-            config={
-                "env": ENV_NAME,
-                "gamma": GAMMA,
-                "tau": TAU,
-                "lr_actor": LR_ACTOR,
-                "lr_critic": LR_CRITIC,
-                "hidden": HIDDEN,
-                "replay_capacity": REPLAY_CAPACITY,
-                "batch_size": BATCH_SIZE,
-                "start_timesteps": START_TIMESTEPS,
-                "expl_noise": EXPL_NOISE,
-                "policy_noise": POLICY_NOISE,
-                "noise_clip": NOISE_CLIP,
-                "policy_delay": POLICY_DELAY,
-                "max_steps": MAX_STEPS,
-                "eval_every": EVAL_EVERY,
-                "eval_episodes": EVAL_EPISODES,
-                "seed": SEED,
-                "device": str(DEVICE),
-            },
-        )
-        # independent x-axis for eval so it never collides with the train step.
-        wandb.define_metric("eval_step")
-        wandb.define_metric("eval_return", step_metric="eval_step")
-        return run
-    except Exception as e:
-        raise RuntimeError(
-            f"W&B initialisation failed: {e}\n"
-            "Run `wandb login` and ensure the `wandb` package is installed."
-        ) from e
+    """Return the pre-initialised wandb run, or None when --no_wandb is set."""
+    return _wandb_run
 
 
 # 
@@ -507,31 +550,36 @@ def main():
                 "buf": buffer.size,
                 "sps": f"{sps:.0f}",
             })
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "avg_return": avg_ret,
-                    "critic_loss": avg_closs,
-                    "actor_loss": avg_aloss,
-                    "avg_q": avg_q,
-                    "buffer_size": buffer.size,
-                    "sps": sps,
-                },
-                step=step,
-            )
+            if run is not None:
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "avg_return": avg_ret,
+                        "critic_loss": avg_closs,
+                        "actor_loss": avg_aloss,
+                        "avg_q": avg_q,
+                        "buffer_size": buffer.size,
+                        "sps": sps,
+                    },
+                    step=step,
+                )
 
         # --- Collect a finished background eval ---
         result = eval_worker.try_collect()
         if result is not None:
             eval_step, eval_ret = result
             tqdm.write(f"[step {eval_step}] eval return: {eval_ret:.1f}")
-            wandb.log({
-                "eval_return": eval_ret,
-                "eval_step": eval_step if eval_step > 0 else step,
-            })
+            if run is not None:
+                wandb.log({
+                    "eval_return": eval_ret,
+                    "eval_step": eval_step if eval_step > 0 else step,
+                })
             if eval_ret > best_eval:
                 best_eval = eval_ret
-                ckpt = os.path.join(os.path.dirname(run.dir), "td3_best.pt")
+                if run is not None:
+                    ckpt = os.path.join(os.path.dirname(run.dir), "td3_best.pt")
+                else:
+                    ckpt = "td3_best.pt"
                 agent.save(ckpt)
                 tqdm.write(f"Saved best checkpoint: {ckpt}")
 
@@ -540,7 +588,27 @@ def main():
             eval_worker.start(step=step)
 
     env.close()
-    wandb.finish()
+    if run is not None:
+        run.summary["eval_return"] = best_eval
+        wandb.finish()
+
+    if args.results_file:
+        import json
+        os.makedirs(os.path.dirname(args.results_file) or ".", exist_ok=True)
+        results = {
+            "env": ENV_NAME,
+            "seed": SEED,
+            "best_eval_return": float(best_eval),
+            "max_steps": MAX_STEPS,
+            "gamma": GAMMA, "tau": TAU,
+            "lr_actor": LR_ACTOR, "lr_critic": LR_CRITIC,
+            "hidden": list(HIDDEN),
+            "batch_size": BATCH_SIZE, "start_timesteps": START_TIMESTEPS,
+            "expl_noise": EXPL_NOISE, "policy_noise": POLICY_NOISE,
+            "noise_clip": NOISE_CLIP, "policy_delay": POLICY_DELAY,
+        }
+        with open(args.results_file, "w") as f:
+            json.dump(results, f)
 
 
 if __name__ == "__main__":
