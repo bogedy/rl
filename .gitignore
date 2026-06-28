@@ -8,3 +8,6 @@ dqn/__pycache__/
 dqn/report.pdf
 .vscode/settings.json
 td3/wandb/
+td3/videos/
+td3/__pycache__/
+td3/videos.zip
